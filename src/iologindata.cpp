@@ -975,6 +975,78 @@ bool IOLoginData::addRewardItems(uint32_t playerId, const ItemBlockList& itemLis
     return query_insert.execute();
 }
 
+bool IOLoginData::savePlayerDepotItems(Player* player)
+{
+	if (!player) {
+		return false;
+	}
+
+	Database& db = Database::getInstance();
+	PropWriteStream propWriteStream;
+
+	if (!db.executeQuery(fmt::format("DELETE FROM `player_depotitems` WHERE `player_id` = {:d}", player->getGUID()))) {
+		return false;
+	}
+
+	DBInsert depotQuery(
+	    "INSERT INTO `player_depotitems` (`player_id`, `pid`, `sid`, `itemtype`, `count`, `attributes`) VALUES ");
+	ItemBlockList itemList;
+
+	for (const auto& it : player->depotChests) {
+		for (const auto& item : it.second->getItemList()) {
+			if (item->getID() >= ITEM_DEPOT_BOX_1 && item->getID() <= ITEM_DEPOT_BOX_17) {
+				if (Container* box = item->getContainer()) {
+					int32_t boxIndex = item->getID() - ITEM_DEPOT_BOX_1;
+					int32_t specialPid = -static_cast<int32_t>(it.first * 20 + boxIndex + 1);
+					for (const auto& subItem : box->getItemList()) {
+						itemList.emplace_back(specialPid, subItem.get());
+					}
+				}
+				continue;
+			}
+			itemList.emplace_back(it.first, item.get());
+		}
+	}
+
+	return saveItems(player, itemList, depotQuery, propWriteStream);
+}
+
+bool IOLoginData::savePlayerInboxItems(Player* player)
+{
+	if (!player) {
+		return false;
+	}
+
+	Database& db = Database::getInstance();
+	PropWriteStream propWriteStream;
+
+	if (!db.executeQuery(fmt::format("DELETE FROM `player_inboxitems` WHERE `player_id` = {:d}", player->getGUID()))) {
+		return false;
+	}
+
+	DBInsert inboxQuery(
+	    "INSERT INTO `player_inboxitems` (`player_id`, `pid`, `sid`, `itemtype`, `count`, `attributes`) VALUES ");
+	ItemBlockList itemList;
+
+	int inboxItemsCount = 0;
+	for (const auto& it : player->depotLockerMap) {
+		for (const auto& item : it.second->getItemList()) {
+			if (item->getID() == ITEM_INBOX) {
+				if (Container* container = item->getContainer()) {
+					for (const auto& subItem : container->getItemList()) {
+						if (++inboxItemsCount > 100) {
+							continue;
+						}
+						itemList.emplace_back(it.first, subItem.get());
+					}
+				}
+			}
+		}
+	}
+
+	return saveItems(player, itemList, inboxQuery, propWriteStream);
+}
+
 bool IOLoginData::savePlayer(Player* player)
 {
 	AutoStat stat("savePlayer", "full");

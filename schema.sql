@@ -298,6 +298,17 @@ CREATE TABLE IF NOT EXISTS `market_offers` (
   FOREIGN KEY (`player_id`) REFERENCES `players`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8;
 
+CREATE TABLE IF NOT EXISTS `market_statistics` (
+  `itemtype` smallint unsigned NOT NULL,
+  `sale` tinyint NOT NULL DEFAULT '0',
+  `day` int unsigned NOT NULL,
+  `transactions` int unsigned NOT NULL DEFAULT '0',
+  `total_price` bigint unsigned NOT NULL DEFAULT '0',
+  `highest_price` int unsigned NOT NULL DEFAULT '0',
+  `lowest_price` int unsigned NOT NULL DEFAULT '0',
+  PRIMARY KEY (`itemtype`, `sale`, `day`)
+) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8;
+
 CREATE TABLE IF NOT EXISTS `players_online` (
  `player_id` int(11) NOT NULL,
   `broadcasting` tinyint(1) NOT NULL DEFAULT '0',

@@ -161,6 +161,12 @@ void Database::shutdown()
     mysql_library_end();
 }
 
+uint64_t Database::getAffectedRows() const
+{
+	const my_ulonglong rows = mysql_affected_rows(handle.get());
+	return rows == static_cast<my_ulonglong>(-1) ? 0 : static_cast<uint64_t>(rows);
+}
+
 bool Database::beginTransaction()
 {
 	transactionLock = std::unique_lock(databaseLock);

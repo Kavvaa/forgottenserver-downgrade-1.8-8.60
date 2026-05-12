@@ -96,68 +96,6 @@ local marketDepotSessions = {}
 local marketOpenSessions = {}
 local lastExpireCheck = 0
 
--- ============================================================
--- ANTI-DUPE LOCK SYSTEM
--- Lua is single-threaded in TFS, so this table-based lock is
--- sufficient to prevent the same offer being processed twice.
--- Keys: "offer:<id>", "player:<guid>", "owner:<guid>"
--- ============================================================
-local marketLocks = {}
-
-local function acquireLock(key)
-	if marketLocks[key] then
-		return false
-	end
-	marketLocks[key] = true
-	return true
-end
-
-local function releaseLock(key)
-	marketLocks[key] = nil
-end
-
--- Acquire multiple locks at once. Returns true only if ALL succeed.
--- If any fails, already-acquired ones are released automatically.
-local function acquireMultipleLocks(keys)
-	local acquired = {}
-	for _, key in ipairs(keys) do
-		if not acquireLock(key) then
-			for _, k in ipairs(acquired) do
-				releaseLock(k)
-			end
-			return false
-		end
-		acquired[#acquired + 1] = key
-	end
-	return true
-end
-
-local function releaseMultipleLocks(keys)
-	for _, key in ipairs(keys) do
-		releaseLock(key)
-	end
-end
-
--- Rollback a DB-claimed offer (used when delivery fails after DB claim).
--- For full-amount offers (deleted): tries to re-INSERT with original data.
--- For partial offers (updated): restores the subtracted amount.
-local function rollbackOfferClaim(offer, acceptedAmount)
-	if acceptedAmount >= offer.amount then
-		-- Full offer was DELETE'd — restore it
-		return db.query(
-			"INSERT INTO `market_offers` (`id`, `player_id`, `sale`, `itemtype`, `amount`, `created`, `anonymous`, `price`) VALUES (" ..
-			offer.id .. ", " .. offer.playerId .. ", " .. offer.sale .. ", " .. offer.itemId .. ", " ..
-			offer.amount .. ", " .. offer.created .. ", " .. (offer.anonymous and 1 or 0) .. ", " .. offer.price .. ")"
-		)
-	else
-		-- Partial offer: restore subtracted amount
-		return db.query(
-			"UPDATE `market_offers` SET `amount` = `amount` + " .. acceptedAmount ..
-			" WHERE `id` = " .. offer.id
-		)
-	end
-end
-
 local blockedItems = {}
 for _, itemId in ipairs({
 	_G.ITEM_GOLD_COIN,
@@ -551,43 +489,6 @@ local function getPlayerTotalMoney(player)
 	return inventoryMoney + bankBalance
 end
 
-local function removePlayerMarketMoney(player, amount)
-	amount = tonumber(amount) or 0
-	if amount <= 0 then
-		return { inventory = 0, bank = 0 }
-	end
-
-	local inventoryMoney = math.max(0, tonumber(player:getMoney()) or 0)
-	local bankBalance = math.max(0, tonumber(player:getBankBalance()) or 0)
-	if inventoryMoney + bankBalance < amount then
-		return nil
-	end
-
-	local fromInventory = math.min(inventoryMoney, amount)
-	if fromInventory > 0 and not player:removeMoney(fromInventory) then
-		return nil
-	end
-
-	local fromBank = amount - fromInventory
-	if fromBank > 0 then
-		player:setBankBalance(bankBalance - fromBank)
-	end
-
-	return { inventory = fromInventory, bank = fromBank }
-end
-
-local function refundPlayerMarketMoney(player, payment)
-	if not payment then
-		return
-	end
-	if payment.inventory and payment.inventory > 0 then
-		player:addMoney(payment.inventory)
-	end
-	if payment.bank and payment.bank > 0 then
-		player:setBankBalance(player:getBankBalance() + payment.bank)
-	end
-end
-
 local function normalizeDepotId(depotId)
 	depotId = tonumber(depotId) or 0
 	if depotId < 0 then
@@ -611,16 +512,43 @@ local function getPlayerLastDepotId(player)
 	return 0
 end
 
+local function getPlayerTownDepotId(player)
+	if player.getTown then
+		local ok, depotId = pcall(function()
+			local town = player:getTown()
+			return town and town:getId() or 0
+		end)
+		if ok then
+			return normalizeDepotId(depotId)
+		end
+	end
+	return 0
+end
+
+local function resolveMarketDepotId(player, depotId)
+	depotId = normalizeDepotId(depotId)
+	if depotId ~= 0 then
+		return depotId
+	end
+
+	depotId = getPlayerLastDepotId(player)
+	if depotId ~= 0 then
+		return depotId
+	end
+
+	return getPlayerTownDepotId(player)
+end
+
 local function setMarketDepotId(player, depotId)
-	marketDepotSessions[player:getId()] = normalizeDepotId(depotId)
+	marketDepotSessions[player:getId()] = resolveMarketDepotId(player, depotId)
 end
 
 local function getMarketDepotId(player)
 	local depotId = marketDepotSessions[player:getId()]
-	if depotId ~= nil then
+	if depotId ~= nil and depotId ~= 0 then
 		return depotId
 	end
-	return getPlayerLastDepotId(player)
+	return resolveMarketDepotId(player, depotId)
 end
 
 local function getItemTradeCount(item, itemType)
@@ -688,74 +616,6 @@ local function buildDepotItemMap(player)
 	return depotMap
 end
 
-local function addDepotItems(player, itemId, amount)
-	local itemType = ItemType(itemId)
-	if not itemType or itemType:getId() == 0 or amount <= 0 then
-		return false
-	end
-
-	local stackSize = math.max(1, itemType:getStackSize())
-	local remaining = amount
-	for _, box in ipairs(getDepotBoxes(player)) do
-		while remaining > 0 do
-			local count = itemType:isStackable() and math.min(remaining, stackSize) or 1
-			local added = box:addItem(itemId, count)
-			if not added then
-				break
-			end
-			remaining = remaining - count
-		end
-		if remaining <= 0 then
-			return true
-		end
-	end
-	return false
-end
-
-local function collectDepotRemovals(player, itemId, amount)
-	local itemType = ItemType(itemId)
-	if not itemType or itemType:getId() == 0 or amount <= 0 then
-		return nil
-	end
-
-	local removals = {}
-	local found = 0
-	for _, box in ipairs(getDepotBoxes(player)) do
-		for _, item in ipairs(box:getItems(true)) do
-			if item:getId() == itemId then
-				local count = math.min(amount - found, getItemTradeCount(item, itemType))
-				if count > 0 then
-					removals[#removals + 1] = { item = item, count = count }
-					found = found + count
-					if found >= amount then
-						return removals
-					end
-				end
-			end
-		end
-	end
-	return nil
-end
-
-local function removeDepotItems(player, itemId, amount)
-	local removals = collectDepotRemovals(player, itemId, amount)
-	if not removals then
-		return false
-	end
-
-	local removed = 0
-	for _, entry in ipairs(removals) do
-		if not entry.item:remove(entry.count) then
-			if removed > 0 then
-				addDepotItems(player, itemId, removed)
-			end
-			return false
-		end
-		removed = removed + entry.count
-	end
-	return true
-end
-
 local function getMarketOfferCount(playerId)
 	if not tableExists("market_offers") then
 		return 0
@@ -779,156 +639,6 @@ local function calculateFee(price, amount)
 		return 1000
 	end
 	return fee
-end
-
-local function getNextInboxSid(playerId)
-	local sid = 100
-	local resultId = db.storeQuery("SELECT COALESCE(MAX(`sid`), 100) AS `sid` FROM `player_inboxitems` WHERE `player_id` = " .. playerId)
-	if resultId ~= false then
-		sid = result.getDataInt(resultId, "sid")
-		result.free(resultId)
-	end
-	return sid + 1
-end
-
-local function insertInboxItem(playerId, itemId, amount)
-	if not tableExists("player_inboxitems") then
-		return false
-	end
-
-	local itemType = ItemType(itemId)
-	if not itemType or itemType:getId() == 0 then
-		return false
-	end
-
-	local remaining = amount
-	local sid = getNextInboxSid(playerId)
-	while remaining > 0 do
-		local count = 1
-		if itemType:isStackable() then
-			count = math.min(remaining, math.max(1, itemType:getStackSize()))
-		end
-
-		local attributes = db.escapeBlob and db.escapeBlob("", 0) or "''"
-		local query = "INSERT INTO `player_inboxitems` (`player_id`, `sid`, `pid`, `itemtype`, `count`, `attributes`) VALUES (" ..
-			playerId .. ", " .. sid .. ", 0, " .. itemId .. ", " .. count .. ", " .. attributes .. ")"
-		if not db.query(query) then
-			return false
-		end
-
-		remaining = remaining - count
-		sid = sid + 1
-	end
-	return true
-end
-
-local function addItemToInbox(inbox, itemId, amount)
-	local itemType = ItemType(itemId)
-	if not inbox or not itemType or itemType:getId() == 0 or amount <= 0 then
-		return false
-	end
-
-	local stackSize = math.max(1, itemType:getStackSize())
-	local remaining = amount
-	while remaining > 0 do
-		local count = itemType:isStackable() and math.min(remaining, stackSize) or 1
-		if not inbox:addItem(itemId, count, INDEX_WHEREEVER, FLAG_NOLIMIT) then
-			return false
-		end
-		remaining = remaining - count
-	end
-	return true
-end
-
-local function removeInboxItems(player, itemId, amount)
-	local inbox = player:getInbox()
-	local itemType = ItemType(itemId)
-	if not inbox or not itemType or itemType:getId() == 0 or amount <= 0 then
-		return false
-	end
-
-	local removals = {}
-	local found = 0
-	for _, item in ipairs(inbox:getItems(true)) do
-		if item:getId() == itemId then
-			local count = math.min(amount - found, getItemTradeCount(item, itemType))
-			if count > 0 then
-				removals[#removals + 1] = { item = item, count = count }
-				found = found + count
-				if found >= amount then
-					break
-				end
-			end
-		end
-	end
-
-	if found < amount then
-		return false
-	end
-
-	for _, entry in ipairs(removals) do
-		if not entry.item:remove(entry.count) then
-			return false
-		end
-	end
-	return true
-end
-
-local function deliverItemToPlayer(playerId, playerName, itemId, amount)
-	local target = playerName and Player(playerName) or nil
-	if target then
-		local inbox = target:getInbox()
-		if addItemToInbox(inbox, itemId, amount) then
-			return true
-		end
-	end
-	return insertInboxItem(playerId, itemId, amount)
-end
-
-local function creditPlayerBank(playerId, playerName, amount)
-	if amount <= 0 then
-		return true
-	end
-
-	local target = playerName and Player(playerName) or nil
-	if target then
-		target:setBankBalance(target:getBankBalance() + amount)
-		return true
-	end
-
-	return db.query("UPDATE `players` SET `balance` = `balance` + " .. amount .. " WHERE `id` = " .. playerId)
-end
-
-local function addHistory(playerId, sale, itemId, amount, price, state, created)
-	if not tableExists("market_history") then
-		return
-	end
-
-	local now = os.time()
-	local expiresAt = (created or now) + getOfferDuration()
-	db.query("INSERT INTO `market_history` (`player_id`, `sale`, `itemtype`, `amount`, `price`, `expires_at`, `inserted`, `state`) VALUES (" ..
-		playerId .. ", " .. sale .. ", " .. itemId .. ", " .. amount .. ", " .. price .. ", " .. expiresAt .. ", " .. now .. ", " .. state .. ")")
-end
-
-local function fetchOfferById(offerId)
-	local resultId = db.storeQuery("SELECT mo.`id`, mo.`player_id`, mo.`sale`, mo.`itemtype`, mo.`amount`, mo.`created`, mo.`anonymous`, mo.`price`, p.`name` AS `player_name` FROM `market_offers` mo INNER JOIN `players` p ON p.`id` = mo.`player_id` WHERE mo.`id` = " .. offerId .. " LIMIT 1")
-	if resultId == false then
-		return nil
-	end
-
-	local offer = {
-		id = result.getDataInt(resultId, "id"),
-		playerId = result.getDataInt(resultId, "player_id"),
-		sale = result.getDataInt(resultId, "sale"),
-		itemId = result.getDataInt(resultId, "itemtype"),
-		amount = result.getDataInt(resultId, "amount"),
-		created = result.getDataInt(resultId, "created"),
-		anonymous = result.getDataInt(resultId, "anonymous") ~= 0,
-		price = result.getDataInt(resultId, "price"),
-		playerName = result.getDataString(resultId, "player_name")
-	}
-	result.free(resultId)
-	return offer
 end
 
 local function fetchOffers(query)
@@ -1385,42 +1095,15 @@ local function refreshMarket(player, browseId, depotMap)
 	end
 end
 
-local function expireOffers()
+expireOffers = function()
 	local now = os.time()
 	if now - lastExpireCheck < MARKET_EXPIRE_CHECK_INTERVAL or not tableExists("market_offers") then
 		return
 	end
 	lastExpireCheck = now
 
-	local expiredBefore = now - getOfferDuration()
-	local offers = fetchOffers("SELECT mo.`id`, mo.`player_id`, mo.`sale`, mo.`itemtype`, mo.`amount`, mo.`created`, mo.`anonymous`, mo.`price`, p.`name` AS `player_name` FROM `market_offers` mo INNER JOIN `players` p ON p.`id` = mo.`player_id` WHERE mo.`created` <= " .. expiredBefore .. " ORDER BY mo.`created` ASC LIMIT 100")
-	for _, offer in ipairs(offers) do
-		local offerKey = "offer:" .. offer.id
-		-- Skip offers currently being processed by another handler
-		if not acquireLock(offerKey) then
-			logInfo("[CustomMarket] Skipping expire for locked offer " .. offer.id)
-		else
-			-- Atomically claim the offer before returning goods
-			local claimed = db.query("DELETE FROM `market_offers` WHERE `id` = " .. offer.id)
-			if claimed then
-				local returned = true
-				if offer.sale == MARKET_ACTION_BUY then
-					returned = creditPlayerBank(offer.playerId, offer.playerName, offer.price * offer.amount)
-				else
-					returned = deliverItemToPlayer(offer.playerId, offer.playerName, offer.itemId, offer.amount)
-				end
-
-				if returned then
-					offerCountCache[offer.playerId] = nil
-					addHistory(offer.playerId, offer.sale, offer.itemId, offer.amount, offer.price, MARKET_STATE_EXPIRED, offer.created)
-				else
-					-- Delivery failed: restore the offer so it can be retried
-					rollbackOfferClaim(offer, offer.amount)
-					logError("[CustomMarket] Failed to return expired offer " .. offer.id .. " — restored to DB")
-				end
-			end
-			releaseLock(offerKey)
-		end
+	if Game.marketExpireOffers then
+		Game.marketExpireOffers(100)
 	end
 end
 
@@ -1499,91 +1182,29 @@ function createHandler.onReceive(player, msg)
 		return
 	end
 
-	-- Lock player to prevent simultaneous create + create/cancel/accept
-	local playerKey = "player:" .. player:getGuid()
-	if not acquireLock(playerKey) then
-		sendMarketMessage(player, "Market action already in progress.")
-		return
-	end
-
 	expireOffers()
 
 	local actionType = msg:getByte()
 	local itemId = msg:getU16()
 	local amount = msg:getU16()
 	local price = msg:getU32()
-	local anonymous = msg:getByte() ~= 0 and 1 or 0
+	local anonymous = msg:getByte() ~= 0
 
 	local valid, errorMessage = validateOfferPayload(player, actionType, itemId, amount, price)
 	if not valid then
-		releaseLock(playerKey)
 		sendMarketMessage(player, errorMessage)
 		return
 	end
 
-	local totalPrice = price * amount
-	local fee = calculateFee(price, amount)
-	local payment = nil
-	local depotMap = nil
-
-	if actionType == MARKET_ACTION_BUY then
-		if getPlayerTotalMoney(player) < totalPrice + fee then
-			releaseLock(playerKey)
-			sendMarketMessage(player, "You do not have enough money for this buy offer.")
-			return
-		end
-		payment = removePlayerMarketMoney(player, totalPrice + fee)
-		if not payment then
-			releaseLock(playerKey)
-			sendMarketMessage(player, "You do not have enough money for this buy offer.")
-			return
-		end
-	else
-		depotMap = buildDepotItemMap(player)
-		if (depotMap[itemId] or 0) < amount then
-			releaseLock(playerKey)
-			sendMarketMessage(player, "You do not have enough items for this sell offer.")
-			return
-		end
-		if getPlayerTotalMoney(player) < fee then
-			releaseLock(playerKey)
-			sendMarketMessage(player, "You do not have enough money to pay the market fee.")
-			return
-		end
-		if not removeDepotItems(player, itemId, amount) then
-			releaseLock(playerKey)
-			sendMarketMessage(player, "Could not reserve the items for this sell offer.")
-			return
-		end
-		depotMap[itemId] = math.max(0, (depotMap[itemId] or 0) - amount)
-		payment = removePlayerMarketMoney(player, fee)
-		if not payment then
-			addDepotItems(player, itemId, amount)
-			releaseLock(playerKey)
-			sendMarketMessage(player, "Could not pay the market fee.")
-			return
-		end
-	end
-
-	local now = os.time()
-	local ok = db.query("INSERT INTO `market_offers` (`player_id`, `sale`, `itemtype`, `amount`, `created`, `anonymous`, `price`) VALUES (" ..
-		player:getGuid() .. ", " .. actionType .. ", " .. itemId .. ", " .. amount .. ", " .. now .. ", " .. anonymous .. ", " .. price .. ")")
+	local ok, message, browseId = player:marketCreateOffer(actionType, itemId, amount, price, anonymous, getMarketDepotId(player))
 	if not ok then
-		if actionType == MARKET_ACTION_BUY then
-			refundPlayerMarketMoney(player, payment)
-		else
-			addDepotItems(player, itemId, amount)
-			refundPlayerMarketMoney(player, payment)
-		end
-		releaseLock(playerKey)
-		sendMarketMessage(player, "Could not create the market offer.")
+		sendMarketMessage(player, message or "Could not create the market offer.")
 		return
 	end
 
 	offerCountCache[player:getGuid()] = nil
-	releaseLock(playerKey)
-	sendMarketMessage(player, "Market offer created.")
-	refreshMarket(player, itemId, depotMap)
+	sendMarketMessage(player, message or "Market offer created.")
+	refreshMarket(player, browseId or itemId)
 end
 createHandler:register()
 
@@ -1603,50 +1224,15 @@ function cancelHandler.onReceive(player, msg)
 	expireOffers()
 
 	local offerId = msg:getU32()
-	local offer = fetchOfferById(offerId)
-	if not offer or offer.playerId ~= player:getGuid() then
-		sendMarketMessage(player, "Market offer not found.")
+	local ok, message, browseId = player:marketCancelOffer(offerId, getMarketDepotId(player))
+	if not ok then
+		sendMarketMessage(player, message or "Could not cancel the market offer.")
 		return
 	end
 
-	-- Lock both offer and player to prevent cancel + accept race
-	local offerKey = "offer:" .. offerId
-	local playerKey = "player:" .. player:getGuid()
-	if not acquireMultipleLocks({ offerKey, playerKey }) then
-		sendMarketMessage(player, "Market action already in progress.")
-		return
-	end
-
-	-- Revalidate after lock: confirm offer still exists and belongs to player
-	offer = fetchOfferById(offerId)
-	if not offer or offer.playerId ~= player:getGuid() then
-		releaseMultipleLocks({ offerKey, playerKey })
-		sendMarketMessage(player, "Market offer not found.")
-		return
-	end
-
-	-- Atomically claim (delete) the offer BEFORE returning goods
-	if not db.query("DELETE FROM `market_offers` WHERE `id` = " .. offer.id .. " AND `player_id` = " .. player:getGuid()) then
-		releaseMultipleLocks({ offerKey, playerKey })
-		sendMarketMessage(player, "Could not cancel the market offer.")
-		return
-	end
 	offerCountCache[player:getGuid()] = nil
-
-	-- Return goods after safe DB claim
-	if offer.sale == MARKET_ACTION_BUY then
-		player:setBankBalance(player:getBankBalance() + offer.price * offer.amount)
-	else
-		-- Use deliverItemToPlayer (inbox/depot) instead of raw addItem
-		if not deliverItemToPlayer(player:getGuid(), player:getName(), offer.itemId, offer.amount) then
-			logError("[CustomMarket] Failed to return cancelled sell offer " .. offer.id .. " items to player " .. player:getName())
-		end
-	end
-
-	addHistory(player:getGuid(), offer.sale, offer.itemId, offer.amount, offer.price, MARKET_STATE_CANCELLED, offer.created)
-	releaseMultipleLocks({ offerKey, playerKey })
-	sendMarketMessage(player, "Market offer cancelled.")
-	refreshMarket(player, MARKET_REQUEST_MY_OFFERS)
+	sendMarketMessage(player, message or "Market offer cancelled.")
+	refreshMarket(player, browseId or MARKET_REQUEST_MY_OFFERS)
 end
 cancelHandler:register()
 
@@ -1668,155 +1254,22 @@ function acceptHandler.onReceive(player, msg)
 	local offerId = msg:getU32()
 	local amount = msg:getU16()
 
-	-- Pre-check before acquiring locks (avoids locking on obvious invalid state)
-	local offer = fetchOfferById(offerId)
-	if not offer then
-		sendMarketMessage(player, "Market offer not found.")
-		return
-	end
-	if offer.playerId == player:getGuid() then
-		sendMarketMessage(player, "You cannot accept your own market offer.")
+	local ok, message, browseId, ownerName = player:marketAcceptOffer(offerId, amount, getMarketDepotId(player))
+	if not ok then
+		sendMarketMessage(player, message or "Could not accept the market offer.")
 		return
 	end
 
-	-- Acquire locks: offer + acceptor player + offer owner
-	local offerKey  = "offer:"  .. offerId
-	local buyerKey  = "player:" .. player:getGuid()
-	local ownerKey  = "owner:"  .. offer.playerId
-	if not acquireMultipleLocks({ offerKey, buyerKey, ownerKey }) then
-		sendMarketMessage(player, "Market action already in progress.")
-		return
-	end
+	sendMarketMessage(player, message or "Market offer accepted.")
+	refreshMarket(player, browseId)
 
-	-- Revalidate offer AFTER acquiring locks
-	offer = fetchOfferById(offerId)
-	if not offer then
-		releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-		sendMarketMessage(player, "Market offer not found.")
-		return
-	end
-	if offer.playerId == player:getGuid() then
-		releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-		sendMarketMessage(player, "You cannot accept your own market offer.")
-		return
-	end
-
-	amount = clamp(amount, 1, offer.amount)
-	local totalPrice = amount * offer.price
-	local depotMap = nil
-
-	-- ================================================================
-	-- STEP 1: Atomically claim the offer in DB BEFORE any item/money
-	-- transfer. This is the core anti-dupe guarantee.
-	-- ================================================================
-	local dbClaimed
-	if amount == offer.amount then
-		-- Full accept: DELETE with amount guard so a concurrent op can't sneak in
-		dbClaimed = db.query(
-			"DELETE FROM `market_offers` WHERE `id` = " .. offer.id ..
-			" AND `amount` = " .. offer.amount
-		)
-	else
-		-- Partial accept: UPDATE with guard that amount is still sufficient
-		dbClaimed = db.query(
-			"UPDATE `market_offers` SET `amount` = `amount` - " .. amount ..
-			" WHERE `id` = " .. offer.id .. " AND `amount` >= " .. amount
-		)
-	end
-
-	if not dbClaimed then
-		releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-		sendMarketMessage(player, "Market offer is no longer available.")
-		return
-	end
-
-	-- ================================================================
-	-- STEP 2: Transfer money / items. On any failure, rollback the DB
-	-- claim so the offer is restored and the player is not cheated.
-	-- ================================================================
-	if offer.sale == MARKET_ACTION_SELL then
-		-- Acceptor (buyer) pays money, receives item
-		if getPlayerTotalMoney(player) < totalPrice then
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "You do not have enough money.")
-			return
+	if ownerName then
+		local owner = Player(ownerName)
+		if owner then
+			offerCountCache[owner:getGuid()] = nil
+			sendMarketMessage(owner, "One of your market offers was accepted.")
+			refreshMarket(owner, MARKET_REQUEST_MY_OFFERS)
 		end
-
-		local payment = removePlayerMarketMoney(player, totalPrice)
-		if not payment then
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "You do not have enough money.")
-			return
-		end
-
-		if not deliverItemToPlayer(player:getGuid(), player:getName(), offer.itemId, amount) then
-			refundPlayerMarketMoney(player, payment)
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "Could not deliver the item.")
-			return
-		end
-
-		if not creditPlayerBank(offer.playerId, offer.playerName, totalPrice) then
-			-- Critical: item already delivered to buyer — attempt to take it back
-			if not removeInboxItems(player, offer.itemId, amount) then
-				logError("[CustomMarket] CRITICAL: Could not rollback inbox delivery for offer " ..
-					offer.id .. " player " .. player:getName())
-			end
-			refundPlayerMarketMoney(player, payment)
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "Could not credit the seller.")
-			return
-		end
-
-	else
-		-- Acceptor (seller) provides item, receives money; buyer gets item
-		depotMap = buildDepotItemMap(player)
-		if (depotMap[offer.itemId] or 0) < amount then
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "You do not have enough items.")
-			return
-		end
-
-		if not removeDepotItems(player, offer.itemId, amount) then
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "Could not remove the items.")
-			return
-		end
-
-		depotMap[offer.itemId] = math.max(0, (depotMap[offer.itemId] or 0) - amount)
-
-		if not deliverItemToPlayer(offer.playerId, offer.playerName, offer.itemId, amount) then
-			addDepotItems(player, offer.itemId, amount)
-			rollbackOfferClaim(offer, amount)
-			releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-			sendMarketMessage(player, "Could not deliver the item to the buyer.")
-			return
-		end
-
-		player:setBankBalance(player:getBankBalance() + totalPrice)
-	end
-
-	-- ================================================================
-	-- STEP 3: All transfers succeeded — record history and notify.
-	-- ================================================================
-	offerCountCache[offer.playerId] = nil
-	addHistory(offer.playerId, offer.sale, offer.itemId, amount, offer.price, MARKET_STATE_ACCEPTED, offer.created)
-
-	releaseMultipleLocks({ offerKey, buyerKey, ownerKey })
-
-	sendMarketMessage(player, "Market offer accepted.")
-	refreshMarket(player, offer.itemId, depotMap)
-
-	local owner = Player(offer.playerName)
-	if owner then
-		sendMarketMessage(owner, "One of your market offers was accepted.")
-		refreshMarket(owner, MARKET_REQUEST_MY_OFFERS)
 	end
 end
 acceptHandler:register()

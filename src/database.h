@@ -94,6 +94,13 @@ public:
 	uint64_t getLastInsertId() const { return static_cast<uint64_t>(mysql_insert_id(handle.get())); }
 
 	/**
+	 * Retrieve affected rows from the last INSERT/UPDATE/DELETE.
+	 *
+	 * @return affected rows, or 0 when MySQL reports an error value.
+	 */
+	uint64_t getAffectedRows() const;
+
+	/**
 	 * Get database engine version
 	 *
 	 * @return the database engine version

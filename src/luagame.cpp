@@ -7,6 +7,7 @@
 #include "events.h"
 #include "game.h"
 #include "luascript.h"
+#include "marketmanager.h"
 #include "monster.h"
 #include "monsters.h"
 #include "npc.h"
@@ -360,6 +361,14 @@ int luaGameGetCurrencyItems(lua_State* L)
 		setMetatable(L, -1, "ItemType");
 		lua_rawseti(L, -2, size--);
 	}
+	return 1;
+}
+
+int luaGameMarketExpireOffers(lua_State* L)
+{
+	// Game.marketExpireOffers([limit = 100])
+	const uint32_t limit = getInteger<uint32_t>(L, 1, 100);
+	lua_pushinteger(L, MarketManager::getInstance().expireOffers(limit));
 	return 1;
 }
 
@@ -1173,6 +1182,7 @@ void LuaScriptInterface::registerGame()
 	registerMethod("Game", "getNpcCount", luaGameGetNpcCount);
 	registerMethod("Game", "getMonsterTypes", luaGameGetMonsterTypes);
 	registerMethod("Game", "getCurrencyItems", luaGameGetCurrencyItems);
+	registerMethod("Game", "marketExpireOffers", luaGameMarketExpireOffers);
 	registerMethod("Game", "getItemTypeByClientId", luaGameGetItemTypeByClientId);
 	registerMethod("Game", "getTalkActions", luaGameGetTalkActions);
 

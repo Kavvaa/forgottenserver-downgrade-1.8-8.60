@@ -3593,6 +3593,7 @@ const luaL_Reg LuaScriptInterface::luaDatabaseTable[] = {
     {"escapeString", LuaScriptInterface::luaDatabaseEscapeString},
     {"escapeBlob", LuaScriptInterface::luaDatabaseEscapeBlob},
     {"lastInsertId", LuaScriptInterface::luaDatabaseLastInsertId},
+    {"affectedRows", LuaScriptInterface::luaDatabaseAffectedRows},
     {"tableExists", LuaScriptInterface::luaDatabaseTableExists},
     {nullptr, nullptr}};
 
@@ -3692,6 +3693,12 @@ int LuaScriptInterface::luaDatabaseEscapeBlob(lua_State* L)
 int LuaScriptInterface::luaDatabaseLastInsertId(lua_State* L)
 {
 	lua_pushinteger(L, Database::getInstance().getLastInsertId());
+	return 1;
+}
+
+int LuaScriptInterface::luaDatabaseAffectedRows(lua_State* L)
+{
+	lua_pushinteger(L, Database::getInstance().getAffectedRows());
 	return 1;
 }
 

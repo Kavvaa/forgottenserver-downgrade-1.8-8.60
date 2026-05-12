@@ -11,6 +11,7 @@
 #include "luascript.h"
 #include "const.h"
 #include "map.h"
+#include "marketmanager.h"
 #include "mounts.h"
 #include "player.h"
 #include "scriptmanager.h"
@@ -1345,6 +1346,82 @@ int luaPlayerSetBankBalance(lua_State* L)
 	player->setBankBalance(balance);
 	pushBoolean(L, true);
 	return 1;
+}
+
+uint16_t getMarketDepotIdArgument(lua_State* L, const Player* player, int32_t index)
+{
+	if (lua_gettop(L) >= index) {
+		return getInteger<uint16_t>(L, index);
+	}
+
+	if (!player || player->getLastDepotId() < 0) {
+		return 0;
+	}
+	return static_cast<uint16_t>(player->getLastDepotId());
+}
+
+int pushMarketOperationResult(lua_State* L, const MarketOperationResult& result)
+{
+	pushBoolean(L, result.success);
+	Lua::pushString(L, result.message);
+	if (result.browseId != 0) {
+		lua_pushinteger(L, result.browseId);
+	} else {
+		lua_pushnil(L);
+	}
+	if (!result.counterpartyName.empty()) {
+		Lua::pushString(L, result.counterpartyName);
+	} else {
+		lua_pushnil(L);
+	}
+	return 4;
+}
+
+int luaPlayerMarketCreateOffer(lua_State* L)
+{
+	// player:marketCreateOffer(action, itemId, amount, price, anonymous[, depotId])
+	Player* player = getUserdata<Player>(L, 1);
+	if (!player) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	const uint8_t action = getInteger<uint8_t>(L, 2);
+	const uint16_t itemId = getInteger<uint16_t>(L, 3);
+	const uint16_t amount = getInteger<uint16_t>(L, 4);
+	const uint32_t price = getInteger<uint32_t>(L, 5);
+	const bool anonymous = getBoolean(L, 6, false);
+	const uint16_t depotId = getMarketDepotIdArgument(L, player, 7);
+	return pushMarketOperationResult(L, MarketManager::getInstance().createOffer(player, action, itemId, amount, price, anonymous, depotId));
+}
+
+int luaPlayerMarketCancelOffer(lua_State* L)
+{
+	// player:marketCancelOffer(offerId[, depotId])
+	Player* player = getUserdata<Player>(L, 1);
+	if (!player) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	const uint32_t offerId = getInteger<uint32_t>(L, 2);
+	const uint16_t depotId = getMarketDepotIdArgument(L, player, 3);
+	return pushMarketOperationResult(L, MarketManager::getInstance().cancelOffer(player, offerId, depotId));
+}
+
+int luaPlayerMarketAcceptOffer(lua_State* L)
+{
+	// player:marketAcceptOffer(offerId, amount[, depotId])
+	Player* player = getUserdata<Player>(L, 1);
+	if (!player) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	const uint32_t offerId = getInteger<uint32_t>(L, 2);
+	const uint16_t amount = getInteger<uint16_t>(L, 3);
+	const uint16_t depotId = getMarketDepotIdArgument(L, player, 4);
+	return pushMarketOperationResult(L, MarketManager::getInstance().acceptOffer(player, offerId, amount, depotId));
 }
 
 int luaPlayerAddItem(lua_State* L)
@@ -3619,6 +3696,9 @@ void LuaScriptInterface::registerPlayer()
 
 	registerMethod("Player", "getBankBalance", luaPlayerGetBankBalance);
 	registerMethod("Player", "setBankBalance", luaPlayerSetBankBalance);
+	registerMethod("Player", "marketCreateOffer", luaPlayerMarketCreateOffer);
+	registerMethod("Player", "marketCancelOffer", luaPlayerMarketCancelOffer);
+	registerMethod("Player", "marketAcceptOffer", luaPlayerMarketAcceptOffer);
 
 	registerMethod("Player", "addItem", luaPlayerAddItem);
 	registerMethod("Player", "addItemEx", luaPlayerAddItemEx);
